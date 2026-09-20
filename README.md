@@ -10,7 +10,11 @@ operational water data.
 Phase 1 pulled and inspected the raw data. Phase 2 adds a deliberately
 simple anomaly detector. Phase 3 generates and verifies a curated sample
 of incident reports, including a deliberate test of whether the
-faithfulness checker actually catches injected errors.
+faithfulness checker actually catches injected errors. Phase 4 closes the
+one gap phase 3 found with a deterministic check and evaluates the
+combined system. This is the project's central result: semantic
+verification (Noul) and a deterministic check catch different failure
+modes, and a trustworthy report pipeline needs both.
 
 ## Data source
 
@@ -64,7 +68,11 @@ src/analysis/sample_for_reports.py   picks the curated sample of anomalies for p
 src/generation/prompts.py   the report-generation prompt template and the corruption instructions
 src/generation/run_generation.py   generates faithful reports, then deliberately corrupts a third of them
 src/verification/run_faithfulness_eval.py   runs every report through Noul, reports the evaluation honestly
-src/verification/plot_faithfulness_distribution.py   the separation figure
+src/verification/plot_faithfulness_distribution.py   the Noul-alone separation figure
+src/verification/entity_check.py   the deterministic station entity-match check
+src/verification/entity_check_limitations_demo.py   demonstrates the entity check's own false-positive risks
+src/verification/run_combined_eval.py   entity check + Noul combined, full confusion matrix
+src/verification/plot_combined_distribution.py   the combined-system separation figure
 scripts/typesafe_sanity_check.py   one Noul call to confirm the faithfulness checker works
 ```
 
@@ -377,6 +385,129 @@ Distribution figure: `reports/figures/faithfulness_distribution.png`,
 individual P(faithful) scores for faithful reports and each error type,
 threshold line at 0.5. `wrong_station` is the only category that visibly
 straddles the threshold.
+
+## Phase 4: closing the wrong_station gap with a deterministic check
+
+Phase 3 found one real weak spot: Noul missed a `wrong_station`
+corruption outright, scoring 0.90 for a report that said "American R at
+Freeport CA" instead of "Sacramento R at Freeport CA", because every
+number and timestamp still matched and the substituted name was locally
+plausible. Whether a specific station name appears in a specific piece of
+text is not a judgment call, it is exactly the kind of check deterministic
+code does perfectly and a semantic model has no particular advantage at.
+So the fix is not a better prompt or a different threshold, it's a second,
+independent check of a different kind.
+
+### The check
+
+`src/verification/entity_check.py`. A small registry of the six stations,
+each with a primary token (the river or creek name) and, only for the two
+Guadalupe gauges that share a river name, a disambiguating place name
+("kerrville" or "comfort"). The check fails a report if the true
+station's primary token is missing from the text, or if the
+disambiguator is required and missing. Plain substring matching, no LLM
+call, runs before and independent of the Noul score.
+
+### Confirming it closes the gap
+
+Both `wrong_station` cases from phase 3, re-checked directly:
+
+```
+report_id    p_faithful  noul_flags_untrustworthy  entity_check_passed  combined_flags_untrustworthy
+r24_corrupt        0.90                     False                 False                          True
+r13_corrupt        0.22                      True                 False                          True
+```
+
+r24_corrupt is the one Noul missed outright (0.90, would have passed
+alone); the entity check catches it on its own, `sacramento` is not in
+"American R at Freeport CA". r13_corrupt is the one Noul had already
+caught (0.22); the entity check independently catches it too, `french
+broad` is not in "French Creek River at Asheville, NC". Both are now
+caught by a signal Noul isn't involved in.
+
+### Does the entity check introduce new false positives
+
+Checked directly against all 27 faithful reports: zero. The entity check
+passes every one, including the Potomac reports that vary their phrasing
+("Little Falls", "(Little Falls)", "Little Falls Pump Station") and the
+two Guadalupe gauges correctly disambiguated by their place names. That
+is a true statement about this specific 27-report sample, not a claim
+that the check is robust in general, so it was stress-tested separately
+with `src/verification/entity_check_limitations_demo.py` on synthetic
+text the real sample never produced:
+
+```
+[FAIL] LIMITATION: nickname not in registry
+    text: A reading at the Sac River gauge near Freeport was well above normal.
+[FAIL] LIMITATION: abbreviated river name
+    text: The French B. River gauge at Asheville recorded an elevated reading.
+[FAIL] LIMITATION: station referenced only by USGS ID
+    text: Site 01646500 recorded a streamflow reading above the normal range.
+[FAIL] CORRECT CATCH: wrong Guadalupe gauge
+    text: Streamflow at Guadalupe River at Comfort, TX was elevated.
+[PASS] for contrast: full correct name
+    text: Streamflow at Sacramento River at Freeport was elevated.
+```
+
+The first three are genuine false-positive risks: a correct station
+reference, phrased in a way the registry doesn't recognize (a nickname,
+an abbreviation, an ID-only reference), gets wrongly flagged. The fourth
+is not a limitation, it's the check correctly catching an actually wrong
+station reference (the wrong one of the two Guadalupe gauges), included
+to show the difference between a real catch and a false positive. This
+naive string match works here because the generation prompt template
+consistently produces full station names. It would need a larger alias
+registry (or a fallback to matching on latitude/longitude or the USGS
+site ID, both of which are also in the packaged context) before being
+trusted on report text from a different generator with looser phrasing.
+
+### Combined system confusion matrix
+
+| | Noul alone | Combined (entity check + Noul) |
+|---|---|---|
+| False positives (faithful flagged untrustworthy) | 1 (r22, 0.46) | 1 (r22, 0.46, unchanged) |
+| False negatives (corrupted scored trustworthy) | 1 (r24_corrupt, wrong_station) | 0 |
+
+By error type, corrupted reports caught (combined system):
+
+| Error type | caught / total |
+|---|---|
+| wrong_station | 2 / 2 |
+| wrong_parameter | 2 / 2 |
+| wrong_value | 1 / 1 |
+| fabricated_cause | 2 / 2 |
+| fabricated_comparison | 2 / 2 |
+
+All 9 corrupted reports are now caught. The one remaining false positive
+(r22) is unrelated to station identity, a genuinely faithful Sacramento
+temperature report Noul itself scored under 0.5, and the entity check has
+no way to help with that, it isn't a station-identity problem. Closing it
+would need either a Noul threshold below 0.46 (trading away some ability
+to catch weak corruptions) or a separate look at why Noul scored a
+faithful report that low, not something this phase changes.
+
+Figure: `reports/figures/combined_distribution.png`, same layout as the
+phase 3 figure but plotting the effective trust score (Noul's P(faithful)
+forced to 0 whenever the entity check fails, marked with an X). Both
+wrong_station points sit at 0, fully separated from the faithful cluster,
+where one had been sitting at 0.90 under Noul alone. The original
+Noul-only figure (`faithfulness_distribution.png`) is left in place as
+the before picture.
+
+### The general principle
+
+Semantic and deterministic checks catch different failure modes. Noul
+reliably catches fabricated content, a cause, a comparison, a number that
+drifted, because those require understanding whether a claim is actually
+supported by the context. It is measurably weaker at catching a swapped
+proper noun when everything else stays numerically consistent, because
+that is a narrow factual lookup, not a judgment call, and a model trained
+to weigh overall coherence can let a locally plausible substitution
+through. A deterministic check is the reverse: excellent at an exact
+factual lookup, useless at judging whether a fabricated cause is
+plausible or whether a number is even in the right range. Neither check
+subsumes the other. A trustworthy AI-generated report pipeline needs
+both, not a better version of just one.
 
 ## Setup
 
