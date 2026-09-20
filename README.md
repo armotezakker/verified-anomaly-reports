@@ -7,8 +7,9 @@ an operator. Built as a portfolio project aimed at Xylem's stated interest
 in applying modern AI tools to data exploration and decision support on
 operational water data.
 
-This is phase 1: data acquisition and inspection only. No anomaly detection
-or LLM report generation yet.
+Phase 1 pulled and inspected the raw data. Phase 2 adds a deliberately
+simple anomaly detector. LLM report generation and faithfulness
+verification are not built yet.
 
 ## Data source
 
@@ -33,6 +34,16 @@ with calm baseline periods:
 Parameter codes: `00060` streamflow (cubic feet per second), `00010` water
 temperature (degrees Celsius).
 
+### Guadalupe River flood: framing rule
+
+The July 4, 2025 Guadalupe River flood (both the Hunt and Comfort gauges)
+was a real, fatal event. This is a deliberate, stated choice, not an
+oversight: every report, figure, and piece of documentation in this
+project that touches that station stays strictly technical (flow rate,
+gauge height, rate of rise, timing) and never narrates the event
+dramatically or references the human toll. This rule applies to the
+report-generation prompt templates from phase 3 onward as well.
+
 ## Date range
 
 2024-09-01 to 2025-08-31 (one year). Chosen to open right at the start of
@@ -45,6 +56,8 @@ full seasonal temperature cycle for the temperature stations.
 src/data/fetch_nwis.py    pulls raw JSON per station into data/raw/
 src/data/parse_nwis.py    flattens raw JSON into data/processed/readings.parquet
 src/analysis/inspect_data.py   prints summary stats, writes reports/figures/*.png
+src/detection/rolling_iqr.py   the rolling time-based IQR anomaly detector
+src/analysis/run_detection.py  runs the detector on all series, writes data/processed/anomalies.csv and anomaly_context.json
 scripts/typesafe_sanity_check.py   one Noul call to confirm the faithfulness checker works
 ```
 
@@ -103,6 +116,105 @@ Guadalupe near Hunt flood peak found above, asking whether a one-sentence
 generated answer is faithful to the retrieved context. Confirmed working
 from this repo's own venv, `TYPESAFE_API_KEY` read from the environment
 only, never written to a file in this repo.
+
+## Phase 2: anomaly detection
+
+Deliberately simple, not the focus of this project. A rolling, time-based
+IQR (interquartile range) fence per station-parameter series: for each
+point, compute the median and IQR of the trailing 14 days of prior points
+only, and flag the point if it falls outside `median +/- 3 * IQR`. Full
+reasoning in `src/detection/rolling_iqr.py`. In short: IQR over a rolling
+z-score because streamflow is heavily right-skewed and a flood inside the
+window would inflate a rolling mean/standard deviation enough to start
+masking itself; a time-based window rather than a fixed row count so the
+mixed 5-minute/15-minute sampling does not change how much history the
+detector is actually looking at.
+
+Data quality issues from phase 1, resolved before detection:
+
+- Sacramento water temperature's two concurrent sensors are averaged by
+  timestamp before detection (both sensors agree at 99.0% of timestamps,
+  34,703 of 35,040; the other 337 fall back to whichever one reported).
+  This produces one series instead of two competing or double-counted
+  ones.
+- Mixed 5-minute/15-minute sampling is handled by the time-based rolling
+  window itself (see above), not by resampling or interpolating the raw
+  values.
+
+Run with:
+
+```
+.venv/bin/python -m src.analysis.run_detection
+```
+
+### Results
+
+| Site | Parameter | Readings scored | Anomalies flagged | % flagged |
+|---|---|---|---|---|
+| 03451500 French Broad | streamflow | 34,211 | 2,923 | 8.5% |
+| 03451500 French Broad | temperature | 34,289 | 278 | 0.8% |
+| 08166200 Guadalupe (Hunt) | streamflow | 42,038 | 2,535 | 6.0% |
+| 08167000 Guadalupe (Comfort) | streamflow | 41,947 | 2,298 | 5.5% |
+| 01646500 Potomac | streamflow | 46,291 | 2,326 | 5.0% |
+| 01646500 Potomac | temperature | 47,578 | 581 | 1.2% |
+| 11447650 Sacramento | streamflow | 34,812 | 778 | 2.2% |
+| 11447650 Sacramento | temperature | 34,840 | 206 | 0.6% |
+| 04234000 Fall Creek | streamflow | 29,804 | 2,300 | 7.7% |
+
+The flagged fractions are not tuned down. A 14-day trailing IQR fence
+flags every meaningful rise above recent baseline, not only the five
+marquee events below, so most stations show flagged points scattered
+across many smaller storms and thaws through the year in addition to the
+big ones. Confirmed against the overlay plots in
+`reports/figures/<site_id>_<param_code>_anomalies.png`.
+
+### Known real events: caught or missed
+
+All five known real events from phase 1 were caught, each with multiple
+flagged points within 6 hours of the documented peak:
+
+- Hurricane Helene, French Broad River streamflow: caught, 49 flagged
+  points near the 2024-09-27 peak.
+- TX Hill Country flood, Guadalupe near Hunt: caught, 39 flagged points
+  near the 2025-07-04 peak.
+- TX Hill Country flood, Guadalupe at Comfort: caught, 32 flagged points
+  near the 2025-07-04 peak.
+- Potomac River peak flow: caught, 49 flagged points near the 2025-05-16
+  peak.
+- Fall Creek spring spike: caught, 49 flagged points near the 2025-03-06
+  peak.
+
+No known event was missed in this run. That is a genuine result of the
+run, not a target that was tuned toward; thresholds were picked once from
+first principles (`k = 3`, a 14-day window) and left alone. If a future
+change to the station set or date range produces a miss, that should be
+reported the same way, not adjusted away.
+
+### Known limitations, stated plainly
+
+- The detector works at the level of individual readings, not events. A
+  multi-hour flood produces dozens of flagged points rather than one. The
+  packaged anomaly context (below) is at the same per-reading granularity;
+  grouping consecutive flagged points into a single incident is phase 3's
+  job, not solved here.
+- A trailing window that includes a past flood will have an inflated
+  baseline for the following two weeks, which can under-flag a second,
+  smaller event soon after a big one. Not observed in this year of data
+  for these six stations, but a known structural limitation of any
+  trailing-window approach.
+- The IQR fence has no physical floor. For a low-variance baseline period
+  it can compute a lower bound below zero for a quantity that cannot
+  physically be negative (visible in the Fall Creek plot). This never
+  produced a bad flag in this run because no readings were actually
+  negative there, but it is a real gap in the model, not by design.
+
+Anomaly log: `data/processed/anomalies.csv` (not committed). Packaged
+context for phase 3: `data/processed/anomaly_context.json` (not
+committed), one record per flagged reading with exactly: site id, site
+name, latitude, longitude, parameter code and name, timestamp, the
+anomalous value, and the baseline (median, low, high) it was compared
+against. Nothing else, so it can serve as the ground truth the
+faithfulness checker verifies generated reports against.
 
 ## Setup
 
