@@ -20,6 +20,16 @@ different amounts of history depending on which sampling rate happened to
 be active. A time-based window (a trailing N-day span) always covers the
 same wall-clock history regardless of local sampling density, so it does
 not manufacture anomalies purely from a change in sampling rate.
+
+Streamflow lower bound is floored at zero. A pure IQR fence has no
+physical floor and, during a low-variance calm stretch, can compute a
+lower bound below zero for a quantity that cannot physically be negative
+in the ordinary case. This is applied only to streamflow (parameter
+00060), not temperature, since water temperature near freezing can
+legitimately read a hair below zero on some sensors. The floor can only
+raise a lower bound that would otherwise be negative, so it can only add
+flags, never remove one: it is a fix, not a retuning of the detector's
+sensitivity.
 """
 
 from dataclasses import dataclass
@@ -38,10 +48,14 @@ class DetectorConfig:
     k: float = K
 
 
-def detect(series: pd.Series, config: DetectorConfig = DetectorConfig()) -> pd.DataFrame:
+def detect(series: pd.Series, config: DetectorConfig = DetectorConfig(), floor: float | None = None) -> pd.DataFrame:
     """series: a pandas Series of values indexed by UTC datetime, sorted, one
     station-parameter series with any duplicate-sensor issue already
     resolved and no other preprocessing.
+
+    floor: if given, the lower bound is clipped to never go below this
+    value (see module docstring). Pass 0.0 for streamflow, None for
+    temperature.
 
     Returns a DataFrame indexed like `series` with the rolling baseline and
     a `is_anomaly` boolean column. The baseline for a given timestamp is
@@ -58,6 +72,8 @@ def detect(series: pd.Series, config: DetectorConfig = DetectorConfig()) -> pd.D
     iqr = q3 - q1
 
     lower = median - config.k * iqr
+    if floor is not None:
+        lower = lower.clip(lower=floor)
     upper = median + config.k * iqr
 
     out = pd.DataFrame(

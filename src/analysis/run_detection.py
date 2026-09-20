@@ -92,13 +92,16 @@ def main() -> None:
     for (site_id, param_code), g in df.groupby(["site_id", "param_code"]):
         g = g.sort_values("datetime").drop_duplicates("datetime")
         s = pd.Series(g["value"].values, index=pd.DatetimeIndex(g["datetime"]))
-        result = detect(s, config)
+        floor = 0.0 if param_code == "00060" else None
+        result_unfloored = detect(s, config, floor=None)
+        result = detect(s, config, floor=floor)
 
         site_name = g["site_name"].iloc[0]
         param_name = g["param_name"].iloc[0]
         lat, lon = STATION_LOCATIONS[site_id]
 
         n_anom = int(result["is_anomaly"].sum())
+        n_anom_unfloored = int(result_unfloored["is_anomaly"].sum())
         n_scored = int(result["has_baseline"].sum())
         counts.append(
             {
@@ -107,7 +110,9 @@ def main() -> None:
                 "param_code": param_code,
                 "n_readings": len(s),
                 "n_scored": n_scored,
+                "n_anomalies_unfloored": n_anom_unfloored,
                 "n_anomalies": n_anom,
+                "n_anomalies_added_by_floor": n_anom - n_anom_unfloored,
                 "pct_anomalies_of_scored": round(100 * n_anom / n_scored, 3) if n_scored else None,
             }
         )
@@ -136,8 +141,16 @@ def main() -> None:
     pd.set_option("display.width", 200)
     pd.set_option("display.max_columns", None)
 
-    print("=== anomaly counts per series ===")
+    print("=== anomaly counts per series (with zero-floor fix on streamflow) ===")
     print(counts_df.to_string(index=False))
+    total_unfloored = counts_df["n_anomalies_unfloored"].sum()
+    total_floored = counts_df["n_anomalies"].sum()
+    total_scored = counts_df["n_scored"].sum()
+    print(
+        f"\ntotal: {total_unfloored} anomalies before the floor fix, {total_floored} after "
+        f"({total_floored - total_unfloored} added by flooring streamflow lower bound at zero), "
+        f"{total_floored}/{total_scored} = {100*total_floored/total_scored:.2f}% overall"
+    )
     print()
 
     print("=== known real events: caught or missed ===")
